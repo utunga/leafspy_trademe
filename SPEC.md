@@ -10,101 +10,97 @@ Primary analytical question: *"What price should I list this car at, given the a
 
 ## 2. Data Acquisition Approach
 
-### Decision: Browser-driven scrape (not API)
+### Decision: Tampermonkey userscript captures the user's real Firefox browsing (not browser automation, not API).
 
-The TradeMe public API requires an approved developer app, which has a multi-day approval queue and is not viable for a one-off personal task. Path chosen: **headed Playwright browser, low-volume scrape, one-off use only.**
+History: an earlier design used Playwright to drive a headed Chromium browser. TradeMe's bot detection flagged Playwright's Chromium even with a persistent profile, so the design pivoted to a passive-capture model.
 
-**Acknowledged constraints:**
-- TradeMe `robots.txt` explicitly disallows `/a/*listing/` and `/a/*page=`. This project crawls those patterns anyway, justified by personal, one-off, low-volume use to price the owner's own car.
-- This is *not* a sustainable or sharable architecture. It exists to answer one question, once.
+**The user is the crawler.** They browse TradeMe in real Firefox at human pace. A Tampermonkey userscript silently captures `__NEXT_DATA__` and any XHR/fetch responses the page makes, and POSTs each capture to a local Python receiver. No bot detection because the browser is genuinely real.
 
-### Pacing (designed to be invisible)
+### Components
 
-| Step | Delay |
+| Component | Role |
 |---|---|
-| Between detail page loads | `random.uniform(1, 20)` seconds |
-| Between search result pages | `random.uniform(1, 10)` seconds |
-| After page load, before extraction | `random.uniform(1, 5)` seconds |
-| On HTTP 429 / 503 / CAPTCHA / login wall | **Abort the run.** No retry-and-continue. |
-| Max retries per listing | 1, then mark `fetch_failed`, continue |
+| `leaf_harvester.user.js` | Tampermonkey userscript. Runs on `*.trademe.co.nz/*`. Monkey-patches `window.fetch` and `XMLHttpRequest` at `document-start`. Reads `__NEXT_DATA__` at DOMContentLoaded. POSTs each capture to `http://localhost:8765/capture` via `GM_xmlhttpRequest`. Shows a corner-of-screen capture-count badge for user feedback. |
+| `receiver.py` | Local `ThreadingHTTPServer` on 127.0.0.1:8765. Routes captures: listing-detail URLs (`/listing/{id}`) → merge into `cache/listings/{id}.json`; search URLs (`/a/motors/cars/...`) → accumulate listings into `cache/search_manifest.json`; everything → backup copy in `cache/raw_captures/`. |
+| `fetch_leafs.py` | Reads `cache/listings/*.json`, applies `leafspy/parse.py`, writes `leafs.csv`. No network. |
+| `leafspy/parse.py` | Converts a raw TradeMe XHR/__NEXT_DATA__ payload into a flat CSV row. Field names are speculative — iterate after first real capture. |
+| `leafspy/classify.py` | Pure-function classifiers (battery_status, body_status, damage_type, SOH, variant). |
+| `analyze_leafs.ipynb` | Interactive Plotly/ipywidgets dashboard, shared filters across all panels. |
 
-Expected total runtime for ~300 listings: ~50 minutes typical. Run unattended overnight.
+### Pacing & politeness
 
-### Browser session
+There is no pacing logic in the system. **You provide the pacing by browsing at human speed.** TradeMe sees a normal Firefox session at normal-human rates. No retry-with-backoff, no jitter, no robot.
 
-- Playwright sync API, Chromium engine, **headed** (`headless=False`).
-- Persistent browser context at `cache/chromium_profile/` so cookies/state survive across runs.
-- **No TradeMe login** — public data only, no account association.
-- No User-Agent spoofing, default viewport, default everything. Polite by design, not evading detection.
-- First-run consent/region dialogs handled manually by the user — they'll see the window.
+### Acknowledged constraint
 
-### Extraction strategy (in priority order)
+TradeMe `robots.txt` disallows `/a/*listing/` and `/a/*page=`. The chosen architecture sidesteps this by being indistinguishable from the user manually viewing those pages — they are manually viewing them, the userscript only observes what the browser already loaded. Personal one-off use only; this is not a sustainable or sharable design.
 
-1. **Capture XHR responses** the SPA makes to TradeMe's internal API via `page.on("response", ...)`. Most stable.
-2. **Fall back to `__NEXT_DATA__` JSON** embedded in page source if XHR capture fails.
-3. **Never parse the rendered DOM** with CSS/XPath selectors — too brittle across TradeMe re-skins.
+## 3. Capture Scope
 
-## 3. Scrape Scope
+### What gets captured
 
-### Search filters
+Every page on `*.trademe.co.nz` triggers the userscript. For each page:
+- All JSON-content-type XHR/fetch responses (200 status only)
+- The `__NEXT_DATA__` blob from the page source
+- The current `page_url`, `captured_at`, and `source` (`fetch` / `xhr` / `next_data`)
 
-- **Make/model:** Nissan / Leaf (via URL: `https://www.trademe.co.nz/a/motors/cars/nissan/leaf?page=N`)
-- **Region:** all of NZ
-- **Listing status:** active only (not closed/sold — TradeMe hides sold prices anyway)
-- **Condition:** include wrecked / damaged / parts listings — these are the **primary** comparable set for the use case
-- **Listing type:** all (BuyNow, auctions, classifieds — captured with `price_type` tag)
-- **Year/odometer:** no filter at scrape time, filter in analysis
+### What gets persisted
 
-### Pagination
+The receiver:
+- Always saves the raw capture to `cache/raw_captures/{ts}_{source}.json`
+- If `page_url` matches `/listing/(\d+)`, merges into `cache/listings/{id}.json`
+- If `page_url` matches `/a/motors/cars/`, extracts listings array and updates `cache/search_manifest.json`
 
-Walk `?page=N` URLs sequentially. Stop when:
-- A page returns zero listings, OR
-- Listing IDs match the previous page (defensive against TradeMe wrapping), OR
-- We hit `TotalCount` if exposed in XHR response
-
-Log a warning if pagination reaches page 50 (unexpected volume).
-
-Sort order: default ("Featured / Best Match") — does not affect coverage.
+The user controls coverage by what they choose to browse. Practically: visit each listing detail page once. The userscript handles the rest silently.
 
 ## 4. Persistence Model
-
-Per-listing JSON cache, with CSV as a derived artifact:
 
 ```
 leafspy/
 ├── cache/
-│   ├── chromium_profile/       # Playwright persistent context
-│   ├── search_manifest.json    # discovered listing IDs + card data (incremental)
+│   ├── raw_captures/
+│   │   └── {ts}_{source}.json   # every capture, backup/debug
 │   ├── listings/
-│   │   ├── 5234567890.json     # one file per listing detail page
+│   │   ├── 5234567890.json      # merged per-listing capture
 │   │   └── ...
-│   ├── scrape.log              # full timestamped log
-│   └── scrape.log.errors       # errors only
-├── leafs.csv                   # derived from cache/listings/
-└── leafs_summary.md            # closest-comparables markdown
+│   ├── search_manifest.json     # accumulated card data from search pages
+│   ├── search_captures/         # reserved for future use
+│   ├── receiver.log
+│   └── build.log
+├── leafs.csv                    # derived from cache/listings/
+└── leafs_summary.md             # derived
 ```
 
-**Properties:**
-- **Idempotent**: re-run skips any listing ID already in `cache/listings/`.
-- **Resumable**: search manifest written incrementally per page.
-- **Re-derivable**: tweak parsing/classification, re-build CSV without re-scraping.
-- `cache/` is git-ignored. CSV and notebook outputs are git-tracked artifacts.
+**Per-listing JSON shape** (`cache/listings/{id}.json`):
 
-## 5. Captured Fields (per listing JSON)
+```json
+{
+  "listing_id": 5234567890,
+  "listing_url": "https://www.trademe.co.nz/.../listing/5234567890",
+  "captured_at": 1747000000.0,
+  "xhr_payload": { /* listing-shaped dict, picked from captures */ },
+  "all_captures": [ /* every capture event for this listing */ ]
+}
+```
 
-**Raw fields stored verbatim:**
-- `listing_id`, `listing_url`, `fetched_at` (ISO timestamp)
-- `title` (verbatim)
-- `description` (full raw text, line breaks preserved)
-- `buy_now_price`, `start_price`, `current_bid`, `classifieds_price` (any can be null)
+Properties:
+- **Idempotent**: re-browsing a listing appends to `all_captures`, refreshes `xhr_payload`.
+- **Re-derivable**: tweak parsing/classification rules, re-run `fetch_leafs.py`, no re-browsing needed.
+- `cache/` is gitignored. CSV and notebook are derived artifacts.
+
+## 5. Captured Fields (raw, per listing JSON)
+
+Stored verbatim from the captured payload:
+- `listing_id`, `listing_url`, `captured_at`
+- `title`, `description` (free text — full body)
+- `buy_now_price`, `start_price`, `current_bid`, `classifieds_price` (any may be null)
 - `is_negotiable` (bool — "price by negotiation" / "make an offer")
-- `year`, `odometer` (int, parsed)
+- `year`, `odometer`
 - `region`, `location_suburb`
 - `seller_type` (private / dealer)
 - `listing_type` (BuyNow / auction / classified)
-- TradeMe structured motor attributes if present (transmission, fuel, body, color, *condition* field)
 - `model_variant_raw` (raw token from title, e.g., "30G", "X 24kWh")
-- `raw_xhr_response` (whole captured JSON, insurance against missing fields)
+- Whatever else TradeMe surfaces in the payload (the full dict is retained in `xhr_payload`)
 
 ## 6. Derived Fields (in analysis layer)
 
@@ -112,14 +108,14 @@ All classification rules live in `leafspy/classify.py` so notebook and summary s
 
 | Field | Values | Source |
 |---|---|---|
-| `battery_kwh` | 24 / 30 / 40 / 62 / unknown | Explicit in title preferred; year-inferred fallback (pre-2013→24, 2013–2015→24, 2016–2017→30, 2018–2019→40, e+→62) |
-| `battery_kwh_source` | `explicit_in_title` / `inferred_from_year` | Quality flag |
+| `battery_kwh` | 24 / 30 / 40 / 62 / unknown | Explicit in title preferred; year-inferred fallback |
+| `battery_kwh_source` | `explicit_in_title` / `inferred_from_year` / `unknown` | Quality flag |
 | `trim_grade` | S / X / G / SV / SL / e+ / unknown | Regex on title + description |
-| `battery_status` | working / degraded / failed / unknown | Description keywords + SOH if known |
+| `battery_status` | working / degraded / failed / unknown | SOH if known; else description keywords |
 | `body_status` | roadworthy / cosmetic_damage / structural_damage / written_off / unknown | Description + title keywords |
 | `damage_type` | crash / flood / fire / battery_failure / mechanical / cosmetic / none / unknown | Description keywords |
 | `parts_already_stripped` | bool | "stripped", "no battery", "missing parts" keywords |
-| `soh_percent` | float or null | Three-source extraction (see below) |
+| `soh_percent` | float or null | Three-source extraction |
 | `soh_bars` | int or null | Same |
 | `soh_source` | `structured` / `regex_percent` / `regex_bars` / `none` | Quality flag |
 | `effective_price` | float or null | `buy_now_price` ?? `classifieds_price` ?? `current_bid` (if > start_price) ?? `start_price` |
@@ -128,12 +124,10 @@ All classification rules live in `leafspy/classify.py` so notebook and summary s
 
 ### SOH extraction priority
 
-1. TradeMe structured `BatteryHealth` / `BatteryCondition` field if present
-2. Regex on title + description for `SOH NN%`, `NN% SOH`, `battery health NN%`
-3. Regex for `NN/12 bars`, `NN bars` (mapped to approximate %: 12→100, 11→85, 10→78, 9→70, …)
+1. TradeMe structured field if present in payload
+2. Regex `SOH NN%`, `NN% SOH`, `battery health NN%`
+3. Regex `NN/12 bars`, `NN bars`, mapped to approximate % (12→100, 11→85, …)
 4. Else `soh_source='none'`
-
-Listings without SOH stay in the dataset but are excluded from SOH-vs-price plots.
 
 ## 7. Analysis & Visualization
 
@@ -145,43 +139,35 @@ Listings without SOH stay in the dataset but are excluded from SOH-vs-price plot
 
 | Cell | Content |
 |---|---|
-| 1 | Imports, load `leafs.csv` via `leafspy/schema.py` |
-| 2 | **Shared filter widgets** — multi-select for trim_grade, battery_kwh, battery_status, body_status, price_type; range slider for year. Drive all plots below. |
-| 3 | Dropdown for x-axis selection (year / odometer / soh_percent) |
-| 4 | **2D scatter:** x = chosen axis, y = effective_price, color = trim_grade. Hover tooltips: title, region, listing_url (clickable markdown link), description excerpt. |
-| 5 | **3D scatter:** x = year, y = soh_percent, z = effective_price, color = trim_grade. Drag-to-rotate. |
-| 6 | **Box plot:** effective_price by battery_status × body_status 2×2 cell — surfaces the "battery donor" and "shell car" market segments. |
-| 7 | **Box plot:** effective_price by trim_grade, faceted by battery_status |
-| 8 | **Markdown summary** (rendered from `leafspy/summarize.py`) — closest comparables to seller's car spec, with median/range/dealer-vs-private skew |
-
-The seller's own car is **not** plotted as a marker — they can read where it sits.
-
-### Markdown summary spec (`summarize.py` output)
-
-For comparables filter (configurable, defaults: same trim_grade, same battery_status, same body_status, year ±2):
-- Count of matches
-- Median, 25th–75th percentile range
-- Dealer vs private skew
-- Adjacent-cell context: working-version median, donor-car median, implied "shell value"
+| 1 | Imports, load `leafs.csv` |
+| 2 | Shared filter widgets — multi-select for trim_grade, battery_kwh, battery_status, body_status, price_type; range slider for year. |
+| 3 | X-axis dropdown (year / odometer / soh_percent) |
+| 4 | 2D scatter — x = chosen axis, y = effective_price, color = trim_grade. Hover: title, region, listing_url, key fields. |
+| 5 | 3D scatter — year × soh_percent × effective_price, color = trim_grade. |
+| 6 | Box plot — effective_price by battery_status × body_status 2×2 cell. |
+| 7 | Box plot — effective_price by trim_grade, faceted by battery_status |
+| 8 | Markdown summary — closest comparables to the seller's car spec. |
 
 ## 8. Project Layout
 
 ```
 leafspy/
-├── fetch_leafs.py              # scraper CLI entry point
-├── analyze_leafs.ipynb         # interactive dashboard
-├── leafspy/                    # shared package
+├── leaf_harvester.user.js       # Tampermonkey userscript
+├── receiver.py                  # local HTTP capture receiver
+├── fetch_leafs.py               # cache → CSV
+├── analyze_leafs.ipynb          # interactive dashboard
+├── leafspy/                     # shared package
 │   ├── __init__.py
-│   ├── scrape.py               # Playwright orchestration
-│   ├── parse.py                # extract structured fields from XHR/page
-│   ├── classify.py             # all classification rules (battery_status, body_status, SOH, variant, etc.)
-│   ├── schema.py               # CSV columns, dtypes, comparable-set defaults
-│   └── summarize.py            # markdown comparables summary
-├── cache/                      # gitignored
-├── leafs.csv                   # derived
-├── leafs_summary.md            # derived
+│   ├── parse.py                 # payload → schema row
+│   ├── classify.py              # battery/body/SOH/variant heuristics
+│   ├── schema.py                # CSV columns, enums
+│   └── summarize.py             # markdown comparables summary
+├── cache/                       # gitignored
+├── leafs.csv                    # derived
+├── leafs_summary.md             # derived
 ├── pyproject.toml
-├── .gitignore                  # excludes cache/, .env, __pycache__/
+├── .gitignore
+├── SPEC.md
 └── README.md
 ```
 
@@ -189,57 +175,47 @@ leafspy/
 
 - **Python 3.11+**
 - **uv** for venv + dependency management
+- **Firefox** (only browser tested)
+- **Tampermonkey** Firefox extension
 
-**Dependencies (`pyproject.toml`):**
-- `playwright` — browser automation
-- `beautifulsoup4` — description text cleanup
-- `pandas` — dataframe / CSV
-- `plotly` — interactive plots
-- `jupyterlab` — notebook environment
-- `ipywidgets` — filter UI in notebook
-- `tqdm` — scrape progress bar
+**Dependencies (`pyproject.toml`):** `pandas`, `plotly`, `jupyterlab`, `ipywidgets`, `anywidget`. No playwright, no scraping libs — receiver uses stdlib only.
 
-**Setup:**
-```
-uv sync
-uv run playwright install chromium
-```
+## 10. CLI Surface
 
-**Run:**
+### `receiver.py`
+
 ```
-uv run python fetch_leafs.py                  # full scrape
-uv run python fetch_leafs.py --max-listings 10  # smoke test
-uv run jupyter lab analyze_leafs.ipynb        # open dashboard
+receiver.py
+  --cache-dir PATH      # default ./cache
+  --port N              # default 8765
+  --host HOST           # default 127.0.0.1
 ```
 
-## 10. CLI Surface (`fetch_leafs.py`)
+### `fetch_leafs.py`
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--max-listings N` | unlimited | Cap detail-page fetches (smoke testing) |
-| `--max-pages N` | unlimited | Cap search-discovery pages (smoke testing) |
-| `--refresh` | off | Ignore cache, re-fetch everything |
-| `--refresh-older-than D` | off | Re-fetch listings whose cache file is >D days old |
-| `--cache-dir PATH` | `./cache` | Override cache location |
-| `--output-csv PATH` | `./leafs.csv` | Override CSV output path |
-| `--headless` | off (headed) | Opt-in headless mode |
-| `--dry-run` | off | Walk pagination, list IDs we'd fetch, don't open detail pages |
+```
+fetch_leafs.py
+  --cache-dir PATH      # default ./cache
+  --output-csv PATH     # default ./leafs.csv
+```
 
 ## 11. Logging
 
 | Channel | Content |
 |---|---|
-| Stdout | `tqdm` progress bar; per-listing line `[N/M] {id} "{title}" → cached (Xs)` |
-| `cache/scrape.log` | Timestamped record of every fetch, retry, error, sleep — append mode, survives across runs |
-| `cache/scrape.log.errors` | Errors only, easier to grep |
-
-Standard Python `logging`, single `basicConfig` call. No `structlog` / `loguru` — overkill for a one-off.
+| Stdout (receiver) | Per-capture line: `capture: xhr https://...trademe.co.nz/.../listing/12345 → listing/12345` |
+| `cache/receiver.log` | Persistent receiver log, append mode |
+| `cache/build.log` | `fetch_leafs.py` parse warnings / counts |
 
 ## 12. Known Limitations
 
-- **One-off design.** Not built for repeated/scheduled runs. If TradeMe re-skins their listing pages or changes XHR shape, the parser breaks and needs manual fixing.
-- **ToS-grey by design.** This is acceptable for personal one-off use; do not adapt for any other context.
-- **SOH parsing is heuristic.** Listings that report SOH only via embedded Leaf Spy screenshots are not OCR'd — those listings will have `soh_source='none'`.
-- **No sold-price data.** TradeMe doesn't expose final sale prices; the analysis is based entirely on *asking* prices.
-- **`battery_kwh` inferred from year for ~half of listings** (sellers don't always state battery size). Tagged via `battery_kwh_source` so analysis can filter to explicit-only when desired.
-- **Damage/condition classification is keyword-based and imperfect.** Cache the full description text so rules can be refined post-scrape without re-fetching.
+- **Coverage = what you browse.** If you don't visit a listing in Firefox, it won't be in the dataset. Practically: open the search results, page through, click into each listing of interest.
+- **`leafspy/parse.py` field names are speculative.** First captures will reveal what TradeMe actually uses. Inspect a `cache/listings/{id}.json` `xhr_payload`, update the `_KEY_*` lists, re-run.
+- **One-off design.** Not built for repeated/scheduled runs. The userscript will keep working until TradeMe restructures its frontend.
+- **SOH parsing is heuristic.** Listings with SOH only in image screenshots are not OCR'd.
+- **No sold-price data.** Asking prices only.
+- **ToS-grey by design.** Personal one-off use to price the owner's car. Not adaptable to other contexts.
+
+## 13. Historical Note
+
+A previous design used Playwright to drive a headed Chromium with persistent profile and jittered pacing. TradeMe's bot detection flagged Playwright's CDP-controlled Chromium even at very low rates, so the design pivoted to the userscript model. The non-acquisition code (parse, classify, schema, summarize, notebook) was unchanged across the pivot — only the data-acquisition layer was replaced.

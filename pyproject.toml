@@ -4,14 +4,11 @@ version = "0.1.0"
 description = "NZ Nissan Leaf market analysis — personal-use one-off scraper + interactive dashboard"
 requires-python = ">=3.11"
 dependencies = [
-    "playwright>=1.45",
-    "beautifulsoup4>=4.12",
     "pandas>=2.2",
     "plotly>=5.20",
     "jupyterlab>=4.0",
     "ipywidgets>=8.1",
     "anywidget>=0.9",
-    "tqdm>=4.66",
 ]
 
 [build-system]
