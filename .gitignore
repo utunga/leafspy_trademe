@@ -1,0 +1,25 @@
+# Cache (raw scrape data, browser profile, logs)
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+.env.local
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Derived artifacts — uncomment if you don't want to commit them
+# leafs.csv
+# leafs_summary.md
